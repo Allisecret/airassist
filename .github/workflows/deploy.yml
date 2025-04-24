@@ -1,0 +1,116 @@
+name: Full Cloudflare Pages Auto Deploy
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set environment variables
+        run: |
+          echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+          echo "MAIN_DOMAIN=mainstreetopportunity.com" >> $GITHUB_ENV
+
+      - name: Create CNAME file
+        run: echo "${{ env.REPO_NAME }}.${{ env.MAIN_DOMAIN }}" > CNAME
+
+      - name: Check if Pages project exists
+        id: check_project
+        run: |
+          RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/48457b9b850d4fe50d27682087e4f4ee/pages/projects/${{ env.REPO_NAME }}" \
+            -H "Authorization: Bearer _ZqVg2dU1eZlq0Dj4ieaNw1xJEsLJqsYTIi-9cbN")
+          echo "PROJECT_EXISTS=$(echo $RESPONSE | jq -r '.success')" >> $GITHUB_ENV
+
+      - name: Create Pages project if not exists
+        if: env.PROJECT_EXISTS != 'true'
+        run: |
+          curl -X POST "https://api.cloudflare.com/client/v4/accounts/48457b9b850d4fe50d27682087e4f4ee/pages/projects" \
+          -H "Authorization: Bearer _ZqVg2dU1eZlq0Dj4ieaNw1xJEsLJqsYTIi-9cbN" \
+          -H "Content-Type: application/json" \
+          --data "{
+            \"name\": \"${{ env.REPO_NAME }}\",
+            \"production_branch\": \"main\",
+            \"source\": {
+              \"type\": \"github\",
+              \"config\": {
+                \"owner\": \"Allisecret\",
+                \"repo_name\": \"${{ env.REPO_NAME }}\",
+                \"production_branch\": \"main\"
+              }
+            },
+            \"deployment_configs\": {
+              \"production\": {
+                \"build_command\": \"\",
+                \"destination_dir\": \"\"
+              }
+            }
+          }"
+
+      - name: Get Pages subdomain
+        id: get_url
+        run: |
+          sleep 5
+          INFO=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/48457b9b850d4fe50d27682087e4f4ee/pages/projects/${{ env.REPO_NAME }}" \
+            -H "Authorization: Bearer _ZqVg2dU1eZlq0Dj4ieaNw1xJEsLJqsYTIi-9cbN")
+          SUBDOMAIN=$(echo "$INFO" | jq -r '.result.subdomain')
+          echo "ACTUAL_PAGES_URL=$SUBDOMAIN" >> $GITHUB_ENV
+
+      - name: Create or update DNS record
+        run: |
+          DNS_NAME="${{ env.REPO_NAME }}.mainstreetopportunity.com"
+          CURRENT=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/c4a507b8a76d56902713cef965fdda8b/dns_records?name=$DNS_NAME" \
+            -H "Authorization: Bearer _ZqVg2dU1eZlq0Dj4ieaNw1xJEsLJqsYTIi-9cbN")
+          
+          COUNT=$(echo "$CURRENT" | jq '.result | length')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Creating DNS record"
+            curl -X POST "https://api.cloudflare.com/client/v4/zones/c4a507b8a76d56902713cef965fdda8b/dns_records" \
+              -H "Authorization: Bearer _ZqVg2dU1eZlq0Dj4ieaNw1xJEsLJqsYTIi-9cbN" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"type\": \"CNAME\",
+                \"name\": \"$DNS_NAME\",
+                \"content\": \"${{ env.ACTUAL_PAGES_URL }}\",
+                \"ttl\": 120,
+                \"proxied\": true
+              }"
+          else
+            RECORD_ID=$(echo "$CURRENT" | jq -r '.result[0].id')
+            echo "Updating DNS record"
+            curl -X PUT "https://api.cloudflare.com/client/v4/zones/c4a507b8a76d56902713cef965fdda8b/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer _ZqVg2dU1eZlq0Dj4ieaNw1xJEsLJqsYTIi-9cbN" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"type\": \"CNAME\",
+                \"name\": \"$DNS_NAME\",
+                \"content\": \"${{ env.ACTUAL_PAGES_URL }}\",
+                \"ttl\": 120,
+                \"proxied\": true
+              }"
+          fi
+
+      - name: Attach custom domain to Pages project
+        continue-on-error: true
+        run: |
+          DOMAIN="${{ env.REPO_NAME }}.mainstreetopportunity.com"
+          RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/48457b9b850d4fe50d27682087e4f4ee/pages/projects/${{ env.REPO_NAME }}/domains" \
+            -H "Authorization: Bearer _ZqVg2dU1eZlq0Dj4ieaNw1xJEsLJqsYTIi-9cbN")
+
+          ATTACHED=$(echo "$RESPONSE" | jq -r '.result[].name' | grep "$DOMAIN" || true)
+
+          if [ -z "$ATTACHED" ]; then
+            echo "Attaching custom domain..."
+            curl -X POST "https://api.cloudflare.com/client/v4/accounts/48457b9b850d4fe50d27682087e4f4ee/pages/projects/${{ env.REPO_NAME }}/domains" \
+              -H "Authorization: Bearer _ZqVg2dU1eZlq0Dj4ieaNw1xJEsLJqsYTIi-9cbN" \
+              -H "Content-Type: application/json" \
+              --data "{
+                \"name\": \"$DOMAIN\"
+              }"
+          else
+            echo "Domain already attached."
+          fi
